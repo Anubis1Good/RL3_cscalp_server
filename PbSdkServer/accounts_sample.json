@@ -1,0 +1,27 @@
+{
+    "Accounts": [
+        {
+            "Alias": "LiteInvest",
+            "Account": "ваш_логин_1",
+            "Password": "ваш_пароль_1",
+            "Servers": {
+                "stockLI": "Lite Invest: Акции",
+                "futLI": "Lite Invest: Фьючерсы"
+            }
+        }
+    ],
+    "Sleep_server": {
+        "curLI": "Lite Invest: Фьючерсы",
+        "futTS": "Trade System: Валюта"
+    },
+    "SleepAccounts": [
+        {
+            "Alias": "TradeSystem",
+            "Account": "ваш_логин_2",
+            "Password": "ваш_пароль_2",
+            "Servers": {
+                "stockTS": "Trade System: Акции"
+            }
+        }
+    ]
+}
