@@ -260,26 +260,25 @@ app.MapPost("/order", (OrderRequest req, LayerManagerService layers) =>
             // Округляем переданную цену до шага инструмента
             finalPrice = Math.Round(Math.Round(req.Price.Value / step) * step, decimals);
         }
-        else
+                else
         {
-            // Автоцена: встаем лучшим в стакан, если позволяет спред, иначе вместе с лучшим
-            double bestBid = layer.LastStock.BestBid;
-            double bestAsk = layer.LastStock.BestAsk;
-
-            if (bestBid <= 0 || bestAsk <= 0 || bestAsk < bestBid)
-                return Results.BadRequest(new { error = "Некорректный стакан для авторасчета цены" });
+            // Автоцена: встаем перед первой ЧУЖОЙ заявкой, если позволяет спред, иначе вместе с ней
+            var (ok, foreignBestBid, foreignBestAsk, err) = GetForeignBestPrices(layer);
+            if (!ok)
+                return Results.BadRequest(new { error = err });
 
             if (isBuy)
             {
-                double nextTick = Math.Round(bestBid + step, decimals);
-                finalPrice = nextTick < bestAsk ? nextTick : bestBid;
+                double nextTick = Math.Round(foreignBestBid + step, decimals);
+                finalPrice = nextTick < foreignBestAsk ? nextTick : foreignBestBid;
             }
             else
             {
-                double nextTick = Math.Round(bestAsk - step, decimals);
-                finalPrice = nextTick > bestBid ? nextTick : bestAsk;
+                double nextTick = Math.Round(foreignBestAsk - step, decimals);
+                finalPrice = nextTick > foreignBestBid ? nextTick : foreignBestAsk;
             }
         }
+
 
         OrderAction action = isBuy ? OrderAction.Buy : OrderAction.Sell;
         bool success = layer.SendOrder(finalPrice, req.Amount, action, OrderFlags.Limit);
@@ -322,12 +321,184 @@ app.MapPost("/cancel", (CancelRequest req, LayerManagerService layers) =>
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
+// 12. Декларативная синхронизация заявок (с учетом первой чужой заявки в стакане)
+app.MapPost("/sync-orders", (SyncOrdersRequest req, LayerManagerService layers) =>
+{
+    try
+    {
+        var ctx = layers.GetContext(req.Slot, req.Ticker);
+        var layer = ctx.Layer;
+
+        if (!layer.DispatcherSlot.IsReady || !layer.IsReplicationsDone || !layer.IsStockReceived || layer.LastStock == null)
+        {
+            return Results.BadRequest(new { error = "Слой еще не готов к торговле" });
+        }
+
+        double step = layer.ContractInfo.Step;
+        int decimals = layer.ContractInfo.Decimals;
+        double eps = step * 0.1;
+
+        var incomingOrders = req.Orders ?? new List<SyncOrderItem>();
+        double foreignBestBid = 0;
+        double foreignBestAsk = 0;
+
+        // Ищем первую чужую заявку только если есть заявки с автоценой (Price == null)
+        if (incomingOrders.Any(o => o.Amount > 0 && (!o.Price.HasValue || o.Price.Value <= 0)))
+        {
+            var (ok, fBid, fAsk, err) = GetForeignBestPrices(layer);
+            if (!ok)
+                return Results.BadRequest(new { error = err });
+
+            foreignBestBid = fBid;
+            foreignBestAsk = fAsk;
+        }
+
+        // Формируем целевой список заявок с точными ценами
+        var desiredList = new List<(OrderAction Side, decimal Amount, double Price)>();
+        foreach (var item in incomingOrders)
+        {
+            if (item.Amount <= 0) continue;
+
+            bool isBuy = item.Side.Equals("BUY", StringComparison.OrdinalIgnoreCase);
+            bool isSell = item.Side.Equals("SELL", StringComparison.OrdinalIgnoreCase);
+            if (!isBuy && !isSell)
+                return Results.BadRequest(new { error = $"Некорректная сторона заявки: {item.Side}" });
+
+            double finalPrice;
+            if (item.Price.HasValue && item.Price.Value > 0)
+            {
+                finalPrice = Math.Round(Math.Round(item.Price.Value / step) * step, decimals);
+            }
+            else
+            {
+                if (isBuy)
+                {
+                    double nextTick = Math.Round(foreignBestBid + step, decimals);
+                    finalPrice = nextTick < foreignBestAsk ? nextTick : foreignBestBid;
+                }
+                else
+                {
+                    double nextTick = Math.Round(foreignBestAsk - step, decimals);
+                    finalPrice = nextTick > foreignBestBid ? nextTick : foreignBestAsk;
+                }
+            }
+
+            desiredList.Add((isBuy ? OrderAction.Buy : OrderAction.Sell, item.Amount, finalPrice));
+        }
+
+        // Сверяем с активными лимитками: совпавшие оставляем, лишние снимаем
+        var activeOrders = layer.Lomonitor._List.Where(o => o._RemainAmount > 0).ToList();
+        var unmatchedDesired = new List<(OrderAction Side, decimal Amount, double Price)>(desiredList);
+        int canceledCount = 0;
+
+        foreach (var existing in activeOrders)
+        {
+            int matchIdx = unmatchedDesired.FindIndex(d =>
+                d.Side == existing._Direction &&
+                d.Amount == existing._RemainAmount &&
+                Math.Abs(d.Price - existing._Price) < eps);
+
+            if (matchIdx >= 0)
+            {
+                unmatchedDesired.RemoveAt(matchIdx); // Заявка уже стоит идеально — не трогаем
+            }
+            else
+            {
+                layer.CancelOrder(existing._ID, wait_cancel: true);
+                canceledCount++;
+            }
+        }
+
+        // Выставляем недостающие заявки
+        int placedCount = 0;
+        foreach (var d in unmatchedDesired)
+        {
+            if (layer.SendOrder(d.Price, d.Amount, d.Side, OrderFlags.Limit))
+                placedCount++;
+        }
+
+        return Results.Ok(new
+        {
+            success = true,
+            foreignBestBid,
+            foreignBestAsk,
+            kept = desiredList.Count - unmatchedDesired.Count,
+            canceled = canceledCount,
+            placed = placedCount
+        });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+
 
 
 
 app.Run("http://localhost:7777");
 
+static (bool ok, double foreignBestBid, double foreignBestAsk, string error) GetForeignBestPrices(dynamic layer)
+{
+    int decimals = layer.ContractInfo.Decimals;
+    var myBuyVolByPrice = new Dictionary<double, double>();
+    var mySellVolByPrice = new Dictionary<double, double>();
+
+    foreach (var o in layer.Lomonitor._List)
+    {
+        if (o._RemainAmount <= 0) continue;
+        double p = Math.Round((double)o._Price, decimals);
+        double amt = (double)o._RemainAmount;
+
+        if (o._Direction == OrderAction.Buy)
+            myBuyVolByPrice[p] = myBuyVolByPrice.GetValueOrDefault(p) + amt;
+        else if (o._Direction == OrderAction.Sell)
+            mySellVolByPrice[p] = mySellVolByPrice.GetValueOrDefault(p) + amt;
+    }
+
+    double foreignBestBid = 0;
+    double foreignBestAsk = 0;
+
+    var stock = layer.LastStock;
+    lock (stock)
+    {
+        if (stock.IsDisposed)
+            return (false, 0, 0, "Стакан недоступен (Disposed)");
+
+        var bidSpan = stock.Bids;
+        for (int i = 0; i < bidSpan.Length; i++)
+        {
+            double p = Math.Round((double)bidSpan[i].Price, decimals);
+            double myVol = myBuyVolByPrice.GetValueOrDefault(p);
+            if ((double)bidSpan[i].Amount - myVol > 1e-9)
+            {
+                foreignBestBid = p;
+                break;
+            }
+        }
+
+        var askSpan = stock.Asks;
+        for (int i = 0; i < askSpan.Length; i++)
+        {
+            double p = Math.Round((double)askSpan[i].Price, decimals);
+            double myVol = mySellVolByPrice.GetValueOrDefault(p);
+            if ((double)askSpan[i].Amount - myVol > 1e-9)
+            {
+                foreignBestAsk = p;
+                break;
+            }
+        }
+    }
+
+    if (foreignBestBid <= 0 || foreignBestAsk <= 0 || foreignBestAsk < foreignBestBid)
+        return (false, foreignBestBid, foreignBestAsk, "Не найдены чужие заявки в стакане для автоцены");
+
+    return (true, foreignBestBid, foreignBestAsk, "");
+}
+
+
 // Модели входящих JSON-запросов
 public record SubscribeRequest(string Slot, List<string> Tickers);
 public record OrderRequest(string Slot, string Ticker, string Side, decimal Amount, double? Price = null);
 public record CancelRequest(string Slot, string Ticker, string? OrderId = null);
+
+public record SyncOrderItem(string Side, decimal Amount, double? Price = null);
+public record SyncOrdersRequest(string Slot, string Ticker, List<SyncOrderItem> Orders);
