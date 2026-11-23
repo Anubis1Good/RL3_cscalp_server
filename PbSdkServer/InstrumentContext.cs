@@ -43,14 +43,15 @@ public class InstrumentContext : ILayerEventsReceiver
     // --- Запрос и кэширование свечей ---
     public async Task<List<CandleDto>> GetCandlesAsync(int tfMinutes, int limit)
     {
-        // Если история по этому таймфрейму уже загружена и обновляется тиками — отдаем из памяти
-        if (_cachedCandles.TryGetValue(tfMinutes, out var existing) && existing.Count >= limit)
+        // Если история по этому таймфрейму уже запрашивалась — отдаем актуальный срез из памяти
+        if (_cachedCandles.TryGetValue(tfMinutes, out var existing))
         {
             lock (_candleLock)
             {
                 return existing.TakeLast(limit).ToList();
             }
         }
+
 
         // Иначе запрашиваем историю с сервера с запасом (учитывая ночные паузы и выходные)
         var tcs = new TaskCompletionSource<List<BaseTicksCandle>>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -120,11 +121,14 @@ public class InstrumentContext : ILayerEventsReceiver
         {
             foreach (var (tfMin, candles) in _cachedCandles)
             {
-                if (candles.Count == 0) continue;
-
-                // Выравниваем время тика по границе таймфрейма
                 long intervalTicks = TimeSpan.FromMinutes(tfMin).Ticks;
                 DateTime barStart = new DateTime((tick.UpdateDateTime.Ticks / intervalTicks) * intervalTicks, tick.UpdateDateTime.Kind);
+
+                if (candles.Count == 0)
+                {
+                    candles.Add(new CandleDto(barStart, tick.Price, tick.Price, tick.Price, tick.Price, tick.Amount));
+                    continue;
+                }
 
                 var last = candles[^1];
                 if (barStart == last.Time)

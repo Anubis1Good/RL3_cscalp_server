@@ -76,26 +76,33 @@ app.MapPost("/subscribe", async (SubscribeRequest req, LayerManagerService layer
 });
 
 // 3. Лучшие цены (BestBid / BestAsk)
+// 3. Лучшие цены (с учетом только чужих заявок в стакане)
 app.MapGet("/best-prices", (string slot, string ticker, LayerManagerService layers) =>
 {
     try
     {
         var ctx = layers.GetContext(slot, ticker);
-        var stock = ctx.Layer.LastStock;
-        if (stock == null || !ctx.Layer.IsStockReceived)
+        var layer = ctx.Layer;
+        var stock = layer.LastStock;
+        if (stock == null || !layer.IsStockReceived)
             return Results.BadRequest(new { error = "Стакан еще не получен" });
+
+        var (ok, fBid, fAsk, _) = GetForeignBestPrices(layer);
 
         return Results.Ok(new
         {
-            bestBid = stock.BestBid,
-            bestAsk = stock.BestAsk,
-            lastPrice = ctx.Layer.LastTick?.Price ?? 0,
-            step = ctx.Layer.ContractInfo.Step,
-            decimals = ctx.Layer.ContractInfo.Decimals
+            bestBid = ok ? fBid : stock.BestBid,
+            bestAsk = ok ? fAsk : stock.BestAsk,
+            rawBestBid = stock.BestBid,
+            rawBestAsk = stock.BestAsk,
+            lastPrice = layer.LastTick?.Price ?? 0,
+            step = layer.ContractInfo.Step,
+            decimals = layer.ContractInfo.Decimals
         });
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
+
 
 // 4. Глубина стакана
 app.MapGet("/orderbook", (string slot, string ticker, int? depth, LayerManagerService layers) =>
@@ -386,21 +393,32 @@ app.MapPost("/sync-orders", (SyncOrdersRequest req, LayerManagerService layers) 
             desiredList.Add((isBuy ? OrderAction.Buy : OrderAction.Sell, item.Amount, finalPrice));
         }
 
-        // Сверяем с активными лимитками: совпавшие оставляем, лишние снимаем
+                // Сверяем с активными лимитками: совпавшие или частично исполненные в ту же сторону оставляем
         var activeOrders = layer.Lomonitor._List.Where(o => o._RemainAmount > 0).ToList();
         var unmatchedDesired = new List<(OrderAction Side, decimal Amount, double Price)>(desiredList);
         int canceledCount = 0;
 
         foreach (var existing in activeOrders)
         {
+            bool isPartiallyFilled = existing._RemainAmount < existing._SourceAmount;
+
+            // 1. Ищем точное совпадение по стороне, объему и цене
             int matchIdx = unmatchedDesired.FindIndex(d =>
                 d.Side == existing._Direction &&
                 d.Amount == existing._RemainAmount &&
                 Math.Abs(d.Price - existing._Price) < eps);
 
+            // 2. Если точного совпадения по цене нет, но заявка ЧАСТИЧНО ИСПОЛНЕНА и направление то же — замораживаем её!
+            if (matchIdx < 0 && req.FreezePartial && isPartiallyFilled)
+            {
+                matchIdx = unmatchedDesired.FindIndex(d =>
+                    d.Side == existing._Direction &&
+                    d.Amount == existing._RemainAmount);
+            }
+
             if (matchIdx >= 0)
             {
-                unmatchedDesired.RemoveAt(matchIdx); // Заявка уже стоит идеально — не трогаем
+                unmatchedDesired.RemoveAt(matchIdx); // Оставляем заявку в стакане без снятия!
             }
             else
             {
@@ -496,9 +514,11 @@ static (bool ok, double foreignBestBid, double foreignBestAsk, string error) Get
 
 
 // Модели входящих JSON-запросов
+// Модели входящих JSON-запросов
 public record SubscribeRequest(string Slot, List<string> Tickers);
 public record OrderRequest(string Slot, string Ticker, string Side, decimal Amount, double? Price = null);
 public record CancelRequest(string Slot, string Ticker, string? OrderId = null);
 
 public record SyncOrderItem(string Side, decimal Amount, double? Price = null);
-public record SyncOrdersRequest(string Slot, string Ticker, List<SyncOrderItem> Orders);
+public record SyncOrdersRequest(string Slot, string Ticker, List<SyncOrderItem> Orders, bool FreezePartial = true);
+
