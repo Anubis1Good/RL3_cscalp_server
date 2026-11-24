@@ -240,7 +240,7 @@ app.MapPost("/order", (OrderRequest req, LayerManagerService layers) =>
         var ctx = layers.GetContext(req.Slot, req.Ticker);
         var layer = ctx.Layer;
 
-        if (!layer.DispatcherSlot.IsReady || !layer.IsReplicationsDone || !layer.IsStockReceived || layer.LastStock == null)
+        if (!layer.DispatcherSlot.IsReady || !layer.IsStockReceived || layer.LastStock == null)
         {
             return Results.BadRequest(new
             {
@@ -251,6 +251,7 @@ app.MapPost("/order", (OrderRequest req, LayerManagerService layers) =>
                 stockReceived = layer.IsStockReceived
             });
         }
+
 
 
         bool isBuy = req.Side.Equals("BUY", StringComparison.OrdinalIgnoreCase);
@@ -336,10 +337,11 @@ app.MapPost("/sync-orders", (SyncOrdersRequest req, LayerManagerService layers) 
         var ctx = layers.GetContext(req.Slot, req.Ticker);
         var layer = ctx.Layer;
 
-        if (!layer.DispatcherSlot.IsReady || !layer.IsReplicationsDone || !layer.IsStockReceived || layer.LastStock == null)
+        if (!layer.DispatcherSlot.IsReady || !layer.IsStockReceived || layer.LastStock == null)
         {
             return Results.BadRequest(new { error = "Слой еще не готов к торговле" });
         }
+
 
         double step = layer.ContractInfo.Step;
         int decimals = layer.ContractInfo.Decimals;
