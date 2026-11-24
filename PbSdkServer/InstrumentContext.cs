@@ -5,6 +5,18 @@ using System.Collections.ObjectModel;
 public record CandleDto(DateTime Time, double Open, double High, double Low, double Close, decimal Volume);
 public record TickDto(DateTime Time, double Price, decimal Amount, string Direction);
 
+public record ClusterDto(
+    DateTime Time,
+    double Price,
+    decimal Amount,
+    string Direction,
+    double HighPrice,
+    double LowPrice,
+    double MaxTickPrice,
+    decimal MaxTickAmount
+);
+
+
 public class InstrumentContext : ILayerEventsReceiver
 {
     public ILayer Layer { get; }
@@ -83,8 +95,9 @@ public class InstrumentContext : ILayerEventsReceiver
         }
     }
 
+
     // --- Запрос кластеров ---
-    public async Task<List<TickGraphicData>> GetClustersAsync(int tfMinutes, int limit)
+    public async Task<List<ClusterDto>> GetClustersAsync(int tfMinutes, int limit)
     {
         var tcs = new TaskCompletionSource<List<TickGraphicData>>(TaskCreationOptions.RunContinuationsAsynchronously);
         _clustersTcs = tcs;
@@ -101,8 +114,22 @@ public class InstrumentContext : ILayerEventsReceiver
             throw new TimeoutException("Таймаут ожидания кластеров от сервера.");
 
         var raw = await tcs.Task;
-        return raw.TakeLast(limit).ToList();
+        return raw
+            .Where(c => !c.IsEmpty)
+            .TakeLast(limit)
+            .Select(c => new ClusterDto(
+                c.UpdateDateTime,
+                c.Price,
+                c.Amount,
+                c.Direction.ToString(),
+                c.HighPrice,
+                c.LowPrice,
+                c.MaxAmountTick.IsEmpty ? 0 : c.MaxAmountTick.Price,
+                c.MaxAmountTick.IsEmpty ? 0 : c.MaxAmountTick.Amount
+            ))
+            .ToList();
     }
+
 
     public List<TickDto> GetTicks(int limit) => _ticks.TakeLast(limit).ToList();
 

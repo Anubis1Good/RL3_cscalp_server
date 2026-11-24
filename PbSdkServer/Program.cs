@@ -448,13 +448,21 @@ app.MapPost("/sync-orders", (SyncOrdersRequest req, LayerManagerService layers) 
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
+app.MapGet("/debug-cluster-type", () =>
+{
+    var t = typeof(TickGraphicData);
+    var props = t.GetProperties().Select(p => $"{p.PropertyType.Name} {p.Name}");
+    var fields = t.GetFields().Select(f => $"{f.FieldType.Name} {f.Name}");
+    return Results.Ok(new { props, fields });
+});
+
 
 
 
 
 app.Run("http://localhost:7777");
 
-static (bool ok, double foreignBestBid, double foreignBestAsk, string error) GetForeignBestPrices(dynamic layer)
+static (bool ok, double foreignBestBid, double foreignBestAsk, string error) GetForeignBestPrices(ILayer layer)
 {
     int decimals = layer.ContractInfo.Decimals;
     var myBuyVolByPrice = new Dictionary<double, double>();
@@ -476,6 +484,9 @@ static (bool ok, double foreignBestBid, double foreignBestAsk, string error) Get
     double foreignBestAsk = 0;
 
     var stock = layer.LastStock;
+    if (stock == null)
+        return (false, 0, 0, "Стакан равен null");
+
     lock (stock)
     {
         if (stock.IsDisposed)
@@ -513,7 +524,6 @@ static (bool ok, double foreignBestBid, double foreignBestAsk, string error) Get
 }
 
 
-// Модели входящих JSON-запросов
 // Модели входящих JSON-запросов
 public record SubscribeRequest(string Slot, List<string> Tickers);
 public record OrderRequest(string Slot, string Ticker, string Side, decimal Amount, double? Price = null);
